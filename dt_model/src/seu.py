@@ -1,42 +1,37 @@
 """
-SEU acquisition strategies for AFA — Decision Tree base learner variant.
+SEU acquisition strategies for AFA — HistGradientBoosting base learner.
 
-Key difference from NB model:
-  - Base learner: sklearn DecisionTreeClassifier (with mode imputation for NaN)
+Key design (following Saar-Tsechansky et al. 2009):
+  - Base learner: HistGradientBoostingClassifier (native NaN support, no imputation)
   - Distribution estimator: NaiveBayesCategorical (for P(F_{i,j} = v_k))
-  - Log Gain should now work correctly, matching the original paper (Saar-Tsechansky et al. 2009)
-
-Strategies:
-  - Uniform      : random acquisition baseline
-  - SEU-US       : SEU with uniform candidate sampling, log-gain utility
-  - SEU-ES       : SEU with uncertainty-based candidate sampling, log-gain utility
-  - SEU-Accuracy : SEU with accuracy gain (ablation)
 """
 
 import numpy as np
-from sklearn.tree import DecisionTreeClassifier
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+try:
+    from sklearn.experimental import enable_hist_gradient_boosting
+except ImportError:
+    pass
+from sklearn.ensemble import HistGradientBoostingClassifier
 from naive_bayes import NaiveBayesCategorical
-from data_utils import impute_mode
 
 
-def _fit_dt(X_masked, y, train_idx):
-    """Fit a decision tree on mode-imputed training data."""
-    X_train = impute_mode(X_masked[train_idx])
-    dt = DecisionTreeClassifier(random_state=0, min_samples_leaf=10)
-    dt.fit(X_train, y[train_idx])
-    return dt
+def _fit_model(X_masked, y, train_idx):
+    hgb = HistGradientBoostingClassifier(
+        random_state=0, max_leaf_nodes=16, min_samples_leaf=10,
+        max_iter=100,
+    )
+    hgb.fit(X_masked[train_idx], y[train_idx])
+    return hgb
 
 
-def _predict_proba_dt(dt, X_masked, indices):
-    """Predict class probabilities with mode imputation for missing values."""
-    X_imp = impute_mode(X_masked[indices])
-    return dt.predict_proba(X_imp)
+def _predict_proba(model, X):
+    return model.predict_proba(X)
 
 
-def _predict_dt(dt, X_masked, indices):
-    """Predict classes with mode imputation."""
-    X_imp = impute_mode(X_masked[indices])
-    return dt.predict(X_imp)
+def _predict(model, X):
+    return model.predict(X)
 
 
 # ---------------------------------------------------------------------------
@@ -57,28 +52,22 @@ def accuracy_gain(pred_before, pred_after, y_val):
 # SEU core
 # ---------------------------------------------------------------------------
 
-def compute_seu_score(dt, nb_model, X_masked, y, i, j,
+def compute_seu_score(model, nb_model, X_masked, y, i, j,
                       utility="log_gain", acquisition_cost=1.0):
-    """
-    Compute SEU score for acquiring feature j of instance i.
-
-    Uses NB to estimate P(F_{i,j} = v_k), and DT to evaluate utility
-    of each hypothetical acquisition outcome.
-    """
     vals, val_probs = nb_model.feature_value_proba(X_masked[i], j)
     if len(vals) == 0:
         return 0.0
 
     row_before = X_masked[i:i+1]
-    proba_before = _predict_proba_dt(dt, row_before, [0])[0]
-    pred_before = dt.classes_[np.argmax(proba_before)]
+    proba_before = _predict_proba(model, row_before)[0]
+    pred_before = model.classes_[np.argmax(proba_before)]
 
     expected_utility = 0.0
     for v_k, p_k in zip(vals, val_probs):
         row_hyp = X_masked[i].copy()
         row_hyp[j] = v_k
-        proba_after = _predict_proba_dt(dt, row_hyp[None, :], [0])[0]
-        pred_after = dt.classes_[np.argmax(proba_after)]
+        proba_after = _predict_proba(model, row_hyp[None, :])[0]
+        pred_after = model.classes_[np.argmax(proba_after)]
 
         if utility == "log_gain":
             u = log_gain(proba_before, proba_after, y[i])
@@ -97,16 +86,12 @@ def select_candidates_us(missing_entries, n_sample, rng):
     return [missing_entries[k] for k in idx]
 
 
-def select_candidates_es(missing_entries, dt, X_masked, n_sample, rng):
-    """
-    Error/uncertainty sampling: prioritize instances with high prediction
-    uncertainty under the DT model.
-    """
+def select_candidates_es(missing_entries, model, X_masked, n_sample, rng):
     if len(missing_entries) <= n_sample:
         return missing_entries
 
     instances = list({i for i, j in missing_entries})
-    proba = _predict_proba_dt(dt, X_masked, instances)
+    proba = _predict_proba(model, X_masked[instances])
     uncertainty = 1.0 - proba.max(axis=1)
     inst_unc = dict(zip(instances, uncertainty))
 
@@ -133,7 +118,6 @@ def run_acquisition(X_full, y, missing_rate, strategy, seed=0,
     X_masked = X_masked.values.copy()
 
     n, d = X_masked.shape
-
     missing_entries = [(i, j) for i in range(n)
                        for j in range(d) if mask[i, j]]
 
@@ -153,12 +137,11 @@ def run_acquisition(X_full, y, missing_rate, strategy, seed=0,
     cost_curve = [0.0]
     cumulative_cost = 0.0
 
-    # Fit DT (base learner) and NB (distribution estimator)
-    dt = _fit_dt(X_masked, y, train_idx)
+    model = _fit_model(X_masked, y, train_idx)
     nb_model = NaiveBayesCategorical()
     nb_model.fit(X_masked[train_idx], y[train_idx])
 
-    acc = (_predict_dt(dt, X_masked, val_idx) == y[val_idx]).mean()
+    acc = (_predict(model, X_masked[val_idx]) == y[val_idx]).mean()
     accuracy_curve = [acc]
 
     remaining = list(missing_entries)
@@ -169,7 +152,6 @@ def run_acquisition(X_full, y, missing_rate, strategy, seed=0,
         log_path = debug_file if debug_file else "utility_debug.txt"
         log_fh = open(log_path, "a")
         log_fh.write(f"\n=== strategy={strategy}  seed={seed}  missing_rate={missing_rate} ===\n")
-        log_fh.write(f"{'Round':>6}  {'#Remaining':>10}  {'Mean':>10}  {'Min':>10}  {'Max':>10}  {'#Pos':>6}\n")
     else:
         log_fh = None
 
@@ -183,10 +165,10 @@ def run_acquisition(X_full, y, missing_rate, strategy, seed=0,
             if strategy_base == "seu-us":
                 candidates = select_candidates_us(remaining, n_sample, rng)
             else:
-                candidates = select_candidates_es(remaining, dt, X_masked, n_sample, rng)
+                candidates = select_candidates_es(remaining, model, X_masked, n_sample, rng)
 
             scores = [
-                compute_seu_score(dt, nb_model, X_masked, y, i, j,
+                compute_seu_score(model, nb_model, X_masked, y, i, j,
                                   utility=utility,
                                   acquisition_cost=acquisition_cost)
                 for (i, j) in candidates
@@ -195,9 +177,9 @@ def run_acquisition(X_full, y, missing_rate, strategy, seed=0,
             if verbose and log_fh:
                 s_arr = np.array(scores)
                 log_fh.write(
-                    f"{round_num:>6}  {len(remaining):>10}  "
-                    f"{s_arr.mean():>10.5f}  {s_arr.min():>10.5f}  "
-                    f"{s_arr.max():>10.5f}  {(s_arr > 0).sum():>6}\n"
+                    f"Round {round_num}: remaining={len(remaining)} "
+                    f"mean={s_arr.mean():.5f} min={s_arr.min():.5f} "
+                    f"max={s_arr.max():.5f} #pos={(s_arr>0).sum()}\n"
                 )
 
             top_idxs = np.argsort(scores)[-bs:][::-1]
@@ -210,13 +192,11 @@ def run_acquisition(X_full, y, missing_rate, strategy, seed=0,
 
         remaining = [e for e in remaining if e in remaining_set]
 
-        # Re-fit both models after acquisition
-        dt = _fit_dt(X_masked, y, train_idx)
+        model = _fit_model(X_masked, y, train_idx)
         nb_model = NaiveBayesCategorical()
         nb_model.fit(X_masked[train_idx], y[train_idx])
 
-        acc = (_predict_dt(dt, X_masked, val_idx) == y[val_idx]).mean()
-
+        acc = (_predict(model, X_masked[val_idx]) == y[val_idx]).mean()
         cost_curve.append(cumulative_cost)
         accuracy_curve.append(acc)
         round_num += 1
@@ -236,6 +216,8 @@ def run_fully_observed_baseline(X_full, y, seed=9999):
     idx = rng.permutation(n)
     split = int(0.8 * n)
     train_idx, val_idx = idx[:split], idx[split:]
-    dt = DecisionTreeClassifier(random_state=0, min_samples_leaf=10)
-    dt.fit(X_full[train_idx], y[train_idx])
-    return (dt.predict(X_full[val_idx]) == y[val_idx]).mean()
+    hgb = HistGradientBoostingClassifier(
+        random_state=0, max_leaf_nodes=16, min_samples_leaf=10, max_iter=100,
+    )
+    hgb.fit(X_full[train_idx], y[train_idx])
+    return (hgb.predict(X_full[val_idx]) == y[val_idx]).mean()

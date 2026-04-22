@@ -25,7 +25,7 @@ from seu import run_acquisition, run_fully_observed_baseline
 N_TRIALS        = 5
 MISSING_RATES   = [0.50, 0.70]
 SAMPLE_FRACTION = 0.05
-BATCH_SIZE      = 10
+BATCH_SIZE      = 50
 RESULT_PREFIX   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                os.pardir, "results", "results_dt")
 
